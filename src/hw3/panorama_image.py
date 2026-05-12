@@ -1,6 +1,7 @@
 import math
 import random
 import numpy as np
+from functools import cmp_to_key
 from typing import List
 from src.hw1.process_image import get_pixel, set_pixel, copy_image
 from src.hw2.modify_image import bilinear_interpolate
@@ -37,16 +38,8 @@ def make_point(x: float, y: float) -> Point:
 # returns: image with both a and b side-by-side.
 def both_images(a: Image, b: Image):
     both = make_image(a.w + b.w, max(a.h, b.h), max(a.c, b.c))
-    for k in range(a.c):
-        for j in range(a.h):
-            for i in range(a.w):
-                set_pixel(both, i, j, k, get_pixel(a, i, j, k))
-
-    for k in range(b.c):
-        for j in range(b.h):
-            for i in range(b.w):
-                set_pixel(both, i + a.w, j, k, get_pixel(b, i, j, k))
-
+    both.data[:a.c, :a.h, :a.w] = a.data
+    both.data[:b.c, :b.h, a.w:a.w + b.w] = b.data
     return both
 
 # Draws lines between matching pixels in two images.
@@ -98,8 +91,7 @@ def find_and_draw_matches(a: Image, b: Image, sigma: float, thresh: float, nms: 
 # int n: number of values in each array.
 # returns: l1 distance between arrays (sum of absolute differences).
 def l1_distance(a: np.ndarray, b: np.ndarray, n: int) -> float:
-    # TODO: return the correct number.
-    return 0.0
+    return float(np.sum(np.abs(a[:n] - b[:n])))
 
 # Finds best matches between descriptors of two images.
 # List[Descriptor] a, b: list of descriptors for pixels in two images.
@@ -108,27 +100,32 @@ def l1_distance(a: np.ndarray, b: np.ndarray, n: int) -> float:
 # returns: best matches found. each descriptor in a should match with at most
 #          one other descriptor in b.
 def match_descriptors(a: List[Descriptor], an: int, b: List[Descriptor], bn: int, mn: List[int]) -> List[Match]:
-    # We will have at most an matches.
     mn[0] = an
     m = [Match() for _ in range(an)]
+
+    # Vectorised L1 distance matrix: shape (an, bn).
+    A = np.stack([a[j].data[:a[j].n] for j in range(an)])          # (an, n)
+    B = np.stack([b[i].data[:b[i].n] for i in range(bn)])          # (bn, n)
+    dists = np.sum(np.abs(A[:, np.newaxis, :] - B[np.newaxis, :, :]), axis=2)  # (an, bn)
+    bind_arr   = np.argmin(dists, axis=1)                           # (an,)
+    best_dists = dists[np.arange(an), bind_arr]                     # (an,)
+
     for j in range(an):
-        # TODO: for every descriptor in a, find best match in b.
-        # record ai as the index in a and bi as the index in b.
-        bind = 0 # <- find the best match
+        bind = int(bind_arr[j])
         m[j].ai = j
-        m[j].bi = bind # <- should be index in b.
-        m[j].p = a[j].p
-        m[j].q = b[bind].p
-        m[j].distance = 0.0 # <- should be the smallest L1 distance!
+        m[j].bi = bind
+        m[j].p  = a[j].p
+        m[j].q  = b[bind].p
+        m[j].distance = float(best_dists[j])
 
     count = 0
     seen = [0] * bn
-    # TODO: we want matches to be injective (one-to-one).
-    # Sort matches based on distance using match_compare.
-    # Then throw out matches to the same element in b. Use seen to keep track.
-    # Each point should only be a part of one match.
-    # Some points will not be in a match.
-    # In practice just bring good matches to front of list, set mn[0].
+    m.sort(key=cmp_to_key(match_compare))
+    for i in range(an):
+        if seen[m[i].bi] == 0:
+            seen[m[i].bi] = 1
+            m[count] = m[i]
+            count += 1
     mn[0] = count
     return m
 
@@ -137,18 +134,14 @@ def match_descriptors(a: List[Descriptor], an: int, b: List[Descriptor], bn: int
 # point p: point to project.
 # returns: point projected using the homography.
 def project_point(H: np.ndarray, p: Point) -> Point:
-    # TODO: project point p with homography H.
-    # Remember that homogeneous coordinates are equivalent up to scalar.
-    # Have to divide by.... something...
-    q = make_point(0, 0)
-    return q
+    v = H @ np.array([p.x, p.y, 1.0])
+    return make_point(v[0] / v[2], v[1] / v[2])
 
 # Calculate L2 distance between two points.
 # point p, q: points.
 # returns: L2 distance between them.
 def point_distance(p: Point, q: Point) -> float:
-    # TODO: should be a quick one.
-    return 0.0
+    return math.sqrt((p.x - q.x)**2 + (p.y - q.y)**2)
 
 # Count number of inliers in a set of matches. Should also bring inliers
 # to the front of the array.
@@ -160,18 +153,31 @@ def point_distance(p: Point, q: Point) -> float:
 #          their match in the other image. Should also rearrange matches
 #          so that the inliers are first in the array. For drawing.
 def model_inliers(H: np.ndarray, m: List[Match], n: int, thresh: float) -> int:
+    if n == 0:
+        return 0
+    # Vectorised projection of all p points through H.
+    pts  = np.array([[m[i].p.x, m[i].p.y, 1.0] for i in range(n)], dtype=np.float64)
+    proj = (H @ pts.T).T                          # (n, 3)
+    px   = proj[:, 0] / proj[:, 2]
+    py   = proj[:, 1] / proj[:, 2]
+    qx   = np.array([m[i].q.x for i in range(n)])
+    qy   = np.array([m[i].q.y for i in range(n)])
+    inlier_mask = np.sqrt((px - qx) ** 2 + (py - qy) ** 2) < thresh
+
     count = 0
-    # TODO: count number of matches that are inliers
-    # i.e. distance(H*p, q) < thresh
-    # Also, sort the matches m so the inliers are the first 'count' elements.
+    for i in range(n):
+        if inlier_mask[i]:
+            m[count], m[i] = m[i], m[count]
+            count += 1
     return count
 
 # Randomly shuffle matches for RANSAC.
 # List[Match] m: matches to shuffle in place.
 # int n: number of elements in matches.
 def randomize_matches(m: List[Match], n: int) -> None:
-    # TODO: implement Fisher-Yates to shuffle the array.
-    pass
+    for i in range(n - 1, 0, -1):
+        j = random.randint(0, i)
+        m[i], m[j] = m[j], m[i]
 
 # Computes homography between two images given matching pixels.
 # List[Match] matches: matching points between images.
@@ -181,19 +187,25 @@ def compute_homography(matches: List[Match], n: int) -> np.ndarray:
     M = np.zeros((n * 2, 8), dtype=np.float64)
     b = np.zeros((n * 2, 1), dtype=np.float64)
 
-    for i in range(n):
-        x  = matches[i].p.x
-        xp = matches[i].q.x
-        y  = matches[i].p.y
-        yp = matches[i].q.y
-        # TODO: fill in the matrices M and b.
+    xs  = np.array([matches[i].p.x for i in range(n)])
+    xps = np.array([matches[i].q.x for i in range(n)])
+    ys  = np.array([matches[i].p.y for i in range(n)])
+    yps = np.array([matches[i].q.y for i in range(n)])
 
-    # TODO: solve system M a = b
-    # If a solution can't be found, return None
+    zeros = np.zeros(n)
+    ones  = np.ones(n)
+    M[0::2] = np.column_stack([xs,    ys,    ones,  zeros, zeros, zeros, -xs * xps, -ys * xps])
+    M[1::2] = np.column_stack([zeros, zeros, zeros, xs,    ys,    ones,  -xs * yps, -ys * yps])
+    b[0::2, 0] = xps
+    b[1::2, 0] = yps
 
-    H = np.zeros((3, 3), dtype=np.float64)
-    # TODO: fill in the homography H based on the result in a.
+    a, res, rank, sv = np.linalg.lstsq(M, b, rcond=None)
+    if rank < 8:
+        return None
 
+    H = np.array([[a[0,0], a[1,0], a[2,0]],
+                  [a[3,0], a[4,0], a[5,0]],
+                  [a[6,0], a[7,0], 1.0   ]])
     return H
 
 # Perform RANdom SAmple Consensus to calculate homography for noisy matches.
@@ -208,16 +220,20 @@ def RANSAC(m: List[Match], n: int, thresh: float, k: int, cutoff: int) -> np.nda
     Hb = np.eye(3, dtype=np.float64)
     Hb[0, 2] = 256.0
     Hb[1, 2] = 0.0
-    # TODO: fill in RANSAC algorithm.
-    # for k iterations:
-    #     shuffle the matches
-    #     compute a homography with a few matches (how many??)
-    #     if new homography is better than old (how can you tell?):
-    #         compute updated homography using all inliers
-    #         remember it and how good it is
-    #         if it's better than the cutoff:
-    #             return it immediately
-    # if we get to the end return the best homography
+    for _ in range(k):
+        randomize_matches(m, n)
+        H = compute_homography(m, 4)
+        if H is None:
+            continue
+        inliers = model_inliers(H, m, n, thresh)
+        if inliers > best:
+            H = compute_homography(m, inliers)
+            if H is None:
+                continue
+            best = model_inliers(H, m, n, thresh)
+            Hb = H
+            if best >= cutoff:
+                return Hb
     return Hb
 
 # Stitches two images together using a projective transformation.
@@ -235,13 +251,13 @@ def combine_images(a: Image, b: Image, H: np.ndarray):
 
     # Find top left and bottom right corners of image b warped into image a.
     botright = make_point(max(c1.x, c2.x, c3.x, c4.x), max(c1.y, c2.y, c3.y, c4.y))
-    topleft = make_point(min(c1.x, c2.x, c3.x, c4.x), min(c1.y, c2.y, c3.y, c4.y))
+    topleft  = make_point(min(c1.x, c2.x, c3.x, c4.x), min(c1.y, c2.y, c3.y, c4.y))
 
     # Find how big our new image should be and the offsets from image a.
     dx = int(min(0, topleft.x))
     dy = int(min(0, topleft.y))
-    w = int(max(a.w, botright.x) - dx)
-    h = int(max(a.h, botright.y) - dy)
+    w  = int(max(a.w, botright.x) - dx)
+    h  = int(max(a.h, botright.y) - dy)
 
     # Can disable this if you are making very big panoramas.
     # Usually this means there was an error in calculating H.
@@ -251,19 +267,39 @@ def combine_images(a: Image, b: Image, H: np.ndarray):
 
     c = make_image(w, h, a.c)
 
-    # Paste image a into the new image offset by dx and dy.
-    for k in range(a.c):
-        for j in range(a.h):
-            for i in range(a.w):
-                pass
-                # TODO: fill in.
+    # Paste image a into the canvas at offset (-dx, -dy).
+    c.data[:a.c, -dy:-dy + a.h, -dx:-dx + a.w] = a.data
 
-    # TODO: Paste in image b as well.
-    # You should loop over some points in the new image (which? all?)
-    # and see if their projection from a coordinates to b coordinates falls
-    # inside of the bounds of image b. If so, use bilinear interpolation to
-    # estimate the value of b at that projection, then fill in image c.
+    # Build a grid of all canvas pixel coordinates and project into b's space.
+    ii, jj = np.meshgrid(np.arange(w, dtype=np.float64),
+                         np.arange(h, dtype=np.float64))             # both (h, w)
+    coords = np.stack([(ii + dx).ravel(),
+                       (jj + dy).ravel(),
+                       np.ones(w * h)], axis=0)                      # (3, w*h)
+    proj = H @ coords                                                 # (3, w*h)
+    qx   = proj[0] / proj[2]
+    qy   = proj[1] / proj[2]
 
+    valid  = (qx >= 0) & (qx < b.w) & (qy >= 0) & (qy < b.h)
+    qx_v, qy_v = qx[valid], qy[valid]
+
+    x0 = np.floor(qx_v).astype(int)
+    y0 = np.floor(qy_v).astype(int)
+    x1 = np.minimum(x0 + 1, b.w - 1)
+    y1 = np.minimum(y0 + 1, b.h - 1)
+    x0 = np.maximum(x0, 0)
+    y0 = np.maximum(y0, 0)
+    fx = qx_v - np.floor(qx_v)
+    fy = qy_v - np.floor(qy_v)
+
+    ci = ii.ravel()[valid].astype(int)
+    cj = jj.ravel()[valid].astype(int)
+
+    for k in range(b.c):
+        c.data[k, cj, ci] = (b.data[k, y0, x0] * (1 - fx) * (1 - fy) +
+                              b.data[k, y0, x1] * fx        * (1 - fy) +
+                              b.data[k, y1, x0] * (1 - fx) * fy        +
+                              b.data[k, y1, x1] * fx        * fy)
     return c
 
 # Create a panoramam between two images.
@@ -305,6 +341,35 @@ def panorama_image(a: Image, b: Image, sigma: float = 2, thresh: float = 5, nms:
 # float f: focal length used to take image (in pixels).
 # returns: image projected onto cylinder, then flattened.
 def cylindrical_project(im: Image, f: float):
-    # TODO: project image onto a cylinder
-    c = copy_image(im)
+    c  = make_image(im.w, im.h, im.c)
+    cx = im.w / 2.0
+    cy = im.h / 2.0
+
+    ii, jj = np.meshgrid(np.arange(im.w, dtype=np.float64),
+                         np.arange(im.h, dtype=np.float64))   # both (h, w)
+    theta  = (ii - cx) / f
+    x_flat = f * np.tan(theta) + cx
+    y_flat = (jj - cy) / np.cos(theta) + cy
+
+    valid  = (x_flat >= 0) & (x_flat < im.w) & (y_flat >= 0) & (y_flat < im.h)
+    xf_v   = x_flat[valid]
+    yf_v   = y_flat[valid]
+
+    x0 = np.floor(xf_v).astype(int)
+    y0 = np.floor(yf_v).astype(int)
+    x1 = np.minimum(x0 + 1, im.w - 1)
+    y1 = np.minimum(y0 + 1, im.h - 1)
+    x0 = np.maximum(x0, 0)
+    y0 = np.maximum(y0, 0)
+    fx = xf_v - np.floor(xf_v)
+    fy = yf_v - np.floor(yf_v)
+
+    ci = ii[valid].astype(int)
+    cj = jj[valid].astype(int)
+
+    for k in range(im.c):
+        c.data[k, cj, ci] = (im.data[k, y0, x0] * (1 - fx) * (1 - fy) +
+                              im.data[k, y0, x1] * fx        * (1 - fy) +
+                              im.data[k, y1, x0] * (1 - fx) * fy        +
+                              im.data[k, y1, x1] * fx        * fy)
     return c

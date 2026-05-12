@@ -70,8 +70,8 @@ def field_panorama():
     save_image(pan5, "output/field_panorama_5")
 
 os.makedirs('output', exist_ok=True)
-draw_corners()
-draw_matches()
-easy_panorama()
-rainier_panorama()
+# draw_corners()
+# draw_matches()
+#easy_panorama()
+# rainier_panorama()
 field_panorama()

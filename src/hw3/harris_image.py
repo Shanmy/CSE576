@@ -1,8 +1,9 @@
 import math
 import numpy as np
+from scipy.ndimage import maximum_filter
 from typing import List
 from src.hw1.process_image import get_pixel, set_pixel, copy_image
-from src.hw2.modify_image import make_gaussian_filter, make_gx_filter, make_gy_filter, convolve_image
+from src.hw2.modify_image import make_gx_filter, make_gy_filter, convolve_image, l1_normalize
 from uwimg import make_image
 
 class Point:
@@ -22,22 +23,21 @@ class Descriptor:
 # returns: descriptor for that index.
 def describe_index(im, i: int) -> Descriptor:
     w = 5
+    half = w // 2
     d = Descriptor()
     d.p.x = i % im.w
     d.p.y = i // im.w
-    d.data = np.zeros(w * w * im.c, dtype=np.float32)
     d.n = w * w * im.c
-    count = 0
-    # If you want you can experiment with other descriptors
-    # This subtracts the central value from neighbors
-    # to compensate some for exposure/lighting changes.
-    for c in range(im.c):
-        cval = im.data[c, i // im.w, i % im.w]
-        for dx in range(-(w // 2), (w + 1) // 2):
-            for dy in range(-(w // 2), (w + 1) // 2):
-                val = get_pixel(im, (i % im.w) + dx, (i // im.w) + dy, c)
-                d.data[count] = cval - val
-                count += 1
+    x = i % im.w
+    y = i // im.w
+    # Pad with edge values to replicate get_pixel clamping behaviour.
+    padded = np.pad(im.data, ((0, 0), (half, half), (half, half)), mode='edge')
+    patch  = padded[:, y:y + w, x:x + w]           # (c, dy, dx)
+    center = im.data[:, y, x][:, None, None]        # (c, 1,  1 )
+    # Transpose to (c, dx, dy) so the ravel order matches the original
+    # nested loop: for dx in ...: for dy in ...:
+    diff   = (center - patch).transpose(0, 2, 1)    # (c, dx, dy)
+    d.data = diff.ravel().astype(np.float32)
     return d
 
 # Marks the spot of a point in an image.
@@ -66,16 +66,23 @@ def mark_corners(im, d: List[Descriptor]) -> None:
 # float sigma: standard deviation of Gaussian.
 # returns: single row image of the filter.
 def make_1d_gaussian(sigma: float):
-    # TODO: make separable 1d Gaussian.
-    return make_image(1, 1, 1)
+    w = int(6 * sigma) | 1
+    filt = make_image(w, 1, 1)
+    center = w // 2
+    for x in range(w):
+        set_pixel(filt, x, 0, 0, math.exp(-(x - center) ** 2 / (2 * sigma * sigma)))
+    l1_normalize(filt)
+    return filt
 
 # Smooths an image using separable Gaussian filter.
 # image im: image to smooth.
 # float sigma: std dev. for Gaussian.
 # returns: smoothed image.
 def smooth_image(im, sigma: float):
-    # TODO: use two convolutions with 1d gaussian filter.
-    return copy_image(im)
+    row = make_1d_gaussian(sigma)
+    col = make_image(1, row.w, 1)   # transpose: same weights, oriented vertically
+    col.data[0] = row.data[0].T
+    return convolve_image(convolve_image(im, row, 1), col, 1)
 
 # Calculate the structure matrix of an image.
 # image im: the input image.
@@ -84,7 +91,24 @@ def smooth_image(im, sigma: float):
 #          third channel is IxIy.
 def structure_matrix(im, sigma: float):
     S = make_image(im.w, im.h, 3)
-    # TODO: calculate structure matrix for im.
+
+    # Compute per-pixel gradients, collapsing channels into one
+    Ix = convolve_image(im, make_gx_filter(), 0)
+    Iy = convolve_image(im, make_gy_filter(), 0)
+
+    # Element-wise products stored as 1-channel images
+    Ix2  = make_image(im.w, im.h, 1)
+    Iy2  = make_image(im.w, im.h, 1)
+    IxIy = make_image(im.w, im.h, 1)
+    Ix2.data[0]  = Ix.data[0] * Ix.data[0]
+    Iy2.data[0]  = Iy.data[0] * Iy.data[0]
+    IxIy.data[0] = Ix.data[0] * Iy.data[0]
+
+    # Gaussian-weighted sum over neighbourhood (separable)
+    S.data[0] = smooth_image(Ix2,  sigma).data[0]
+    S.data[1] = smooth_image(Iy2,  sigma).data[0]
+    S.data[2] = smooth_image(IxIy, sigma).data[0]
+
     return S
 
 # Estimate the cornerness of each pixel given a structure matrix S.
@@ -92,8 +116,12 @@ def structure_matrix(im, sigma: float):
 # returns: a response map of cornerness calculations.
 def cornerness_response(S):
     R = make_image(S.w, S.h, 1)
-    # TODO: fill in R, "cornerness" for each pixel using the structure matrix.
-    # We'll use formulation det(S) - alpha * trace(S)^2, alpha = .06.
+    Ix2  = S.data[0]
+    Iy2  = S.data[1]
+    IxIy = S.data[2]
+    det   = Ix2 * Iy2 - IxIy * IxIy
+    trace = Ix2 + Iy2
+    R.data[0] = det - 0.06 * trace * trace
     return R
 
 # Perform non-max supression on an image of feature responses.
@@ -102,11 +130,9 @@ def cornerness_response(S):
 # returns: image with only local-maxima responses within w pixels.
 def nms_image(im, w: int):
     r = copy_image(im)
-    # TODO: perform NMS on the response map.
-    # for every pixel in the image:
-    #     for neighbors within w:
-    #         if neighbor response greater than pixel response:
-    #             set response to be very low (I use -999999 [why not 0??])
+    # maximum_filter with mode='nearest' replicates get_pixel clamping at borders.
+    local_max = maximum_filter(im.data[0], size=2 * w + 1, mode='nearest')
+    r.data[0] = np.where(im.data[0] == local_max, im.data[0], -999999)
     return r
 
 # Perform harris corner detection and extract features from the corners.
@@ -125,12 +151,8 @@ def harris_corner_detector(im, sigma: float, thresh: float, nms: int) -> List[De
     # Run NMS on the responses
     Rnms = nms_image(R, nms)
 
-    # TODO: count number of responses over threshold
-    count = 1 # change this
-
-    d = [Descriptor() for _ in range(count)]
-    # TODO: fill in array *d with descriptors of corners, use describe_index.
-
+    ys, xs = np.where(Rnms.data[0] > thresh)
+    d = [describe_index(im, int(y) * im.w + int(x)) for y, x in zip(ys, xs)]
     return d
 
 # Find and draw corners on an image.
